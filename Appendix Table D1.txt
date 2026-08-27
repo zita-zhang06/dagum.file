@@ -1,0 +1,249 @@
+﻿from pathlib import Path
+
+import pandas as pd
+from openpyxl.styles import Alignment, Font, PatternFill
+
+def find_data_file():
+    file_names = (
+        "EMDAT(2)(1).xlsx.xlsx",
+        "EMDAT(2)(1).xlsx",
+        "EMDAT.xlsx",
+    )
+
+    folders = (
+        Path.cwd(),
+        Path.home() / "Desktop",
+    )
+
+    for folder in folders:
+        for file_name in file_names:
+            file_path = folder / file_name
+
+            if file_path.exists():
+                return file_path
+
+    raise FileNotFoundError(
+        "The EMDAT Excel file was not found.\n"
+        "Please put EMDAT(2)(1).xlsx.xlsx on the Desktop "
+        "or in the same folder as this Python file."
+    )
+
+
+DATA_FILE = find_data_file()
+
+OUTPUT_FILE = (
+    DATA_FILE.parent
+    / "Table_D1_Sample_Construction.xlsx"
+)
+
+DAMAGE_COLUMN = "Total Damage ('000 US$)"
+
+FLOOD_SUBTYPES = (
+    "Flash flood",
+    "Flood (General)",
+    "Riverine flood",
+)
+
+
+data = pd.read_excel(
+    DATA_FILE,
+    sheet_name="Data all",
+)
+
+data.columns = (
+    data.columns
+    .astype(str)
+    .str.strip()
+)
+
+data["Start Year"] = pd.to_numeric(
+    data["Start Year"],
+    errors="coerce",
+)
+
+data[DAMAGE_COLUMN] = pd.to_numeric(
+    data[DAMAGE_COLUMN],
+    errors="coerce",
+)
+
+
+flood = data.loc[
+    data["Country"]
+    .astype(str)
+    .str.strip()
+    .eq("Brazil")
+
+    & data["Disaster Type"]
+    .astype(str)
+    .str.strip()
+    .eq("Flood")
+
+    & data["Disaster Subtype"]
+    .astype(str)
+    .str.strip()
+    .isin(FLOOD_SUBTYPES)
+
+    & data["Start Year"]
+    .between(2000, 2024)
+].copy()
+
+positive = flood.loc[
+    flood[DAMAGE_COLUMN].notna()
+    & flood[DAMAGE_COLUMN].gt(0)
+].copy()
+
+gdp = pd.read_excel(
+    DATA_FILE,
+    sheet_name="GDP",
+)
+
+gdp.columns = (
+    gdp.columns
+    .astype(str)
+    .str.strip()
+)
+
+gdp["Year"] = pd.to_numeric(
+    gdp["Year"],
+    errors="coerce",
+)
+
+gdp["GDP (current US$)"] = pd.to_numeric(
+    gdp["GDP (current US$)"],
+    errors="coerce",
+)
+
+positive["Year"] = (
+    positive["Start Year"]
+    .astype(int)
+)
+
+positive = positive.merge(
+    gdp[
+        [
+            "Year",
+            "GDP (current US$)",
+        ]
+    ],
+    on="Year",
+    how="left",
+    validate="many_to_one",
+)
+
+if positive["GDP (current US$)"].isna().any():
+    raise ValueError(
+        "GDP is missing for one or more event years."
+    )
+
+positive["Damage ratio"] = (
+    positive[DAMAGE_COLUMN]
+    * 1000.0
+    / positive["GDP (current US$)"]
+)
+
+
+table_d1 = pd.DataFrame(
+    {
+        "Screening stage": [
+            "EM-DAT flood records in Brazil, 2000–2024",
+            "Records without reported monetary damage",
+            "Records with positive reported monetary damage",
+            "Events retained above the baseline Pareto threshold",
+        ],
+
+        "Number of records": [
+            len(flood),
+
+            int(
+                flood[DAMAGE_COLUMN]
+                .isna()
+                .sum()
+            ),
+
+            len(positive),
+
+            int(
+                positive["Damage ratio"]
+                .ge(2e-5)
+                .sum()
+            ),
+        ],
+    }
+)
+
+
+expected_counts = [
+    115,
+    64,
+    51,
+    38,
+]
+
+obtained_counts = (
+    table_d1["Number of records"]
+    .tolist()
+)
+
+if obtained_counts != expected_counts:
+    raise ValueError(
+        "The sample audit failed.\n"
+        f"Expected counts: {expected_counts}\n"
+        f"Obtained counts: {obtained_counts}\n"
+        "Please check the Excel input file."
+    )
+
+with pd.ExcelWriter(
+    OUTPUT_FILE,
+    engine="openpyxl",
+) as writer:
+
+    table_d1.to_excel(
+        writer,
+        sheet_name="Table D1",
+        index=False,
+    )
+
+    worksheet = writer.book["Table D1"]
+
+    header_fill = PatternFill(
+        fill_type="solid",
+        fgColor="D9E2F3",
+    )
+
+    for cell in worksheet[1]:
+        cell.font = Font(
+            bold=True,
+        )
+
+        cell.fill = header_fill
+
+        cell.alignment = Alignment(
+            horizontal="center",
+        )
+
+    worksheet.column_dimensions["A"].width = 58
+    worksheet.column_dimensions["B"].width = 20
+
+    for row in worksheet.iter_rows(
+        min_row=2,
+        min_col=2,
+        max_col=2,
+    ):
+        row[0].alignment = Alignment(
+            horizontal="center",
+        )
+
+print()
+print("TABLE D1 COMPLETED SUCCESSFULLY")
+print("--------------------------------")
+print()
+
+print(
+    table_d1.to_string(
+        index=False,
+    )
+)
+
+print()
+print("The Excel table was saved here:")
+print(OUTPUT_FILE)

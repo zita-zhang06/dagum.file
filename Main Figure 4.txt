@@ -1,0 +1,366 @@
+﻿from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.stats import burr
+
+
+def find_data_file():
+    names = (
+        "EMDAT(2)(1).xlsx.xlsx",
+        "EMDAT(2)(1).xlsx",
+        "EMDAT.xlsx",
+    )
+
+    for folder in (Path.cwd(), Path.home() / "Desktop"):
+        for name in names:
+            path = folder / name
+            if path.exists():
+                return path
+
+    raise FileNotFoundError(
+        "Put EMDAT(2)(1).xlsx.xlsx on the Desktop "
+        "or in the current folder."
+    )
+
+
+DATA_FILE = find_data_file()
+OUTPUT_FOLDER = DATA_FILE.parent
+
+DAMAGE_COLUMN = "Total Damage ('000 US$)"
+GDP_COLUMN = "GDP (current US$)"
+
+FLOOD_SUBTYPES = (
+    "Flash flood",
+    "Flood (General)",
+    "Riverine flood",
+)
+
+PARETO_THRESHOLD = 2e-5
+
+events = pd.read_excel(
+    DATA_FILE,
+    sheet_name="Data all",
+)
+
+gdp = pd.read_excel(
+    DATA_FILE,
+    sheet_name="GDP",
+)
+
+events.columns = events.columns.astype(str).str.strip()
+gdp.columns = gdp.columns.astype(str).str.strip()
+
+events["Start Year"] = pd.to_numeric(
+    events["Start Year"],
+    errors="coerce",
+)
+
+events[DAMAGE_COLUMN] = pd.to_numeric(
+    events[DAMAGE_COLUMN],
+    errors="coerce",
+)
+
+gdp["Year"] = pd.to_numeric(
+    gdp["Year"],
+    errors="coerce",
+)
+
+gdp[GDP_COLUMN] = pd.to_numeric(
+    gdp[GDP_COLUMN],
+    errors="coerce",
+)
+
+mask = (
+    events["Country"].astype(str).str.strip().eq("Brazil")
+    & events["Disaster Type"].astype(str).str.strip().eq("Flood")
+    & events["Disaster Subtype"]
+        .astype(str)
+        .str.strip()
+        .isin(FLOOD_SUBTYPES)
+    & events["Start Year"].between(2000, 2024)
+    & events[DAMAGE_COLUMN].notna()
+    & events[DAMAGE_COLUMN].gt(0)
+)
+
+events = events.loc[mask].copy()
+events["Year"] = events["Start Year"].astype(int)
+
+gdp = gdp.loc[
+    gdp["Year"].between(2000, 2024),
+    ["Year", GDP_COLUMN],
+].copy()
+
+gdp["Year"] = gdp["Year"].astype(int)
+
+data = events.merge(
+    gdp,
+    on="Year",
+    how="left",
+    validate="many_to_one",
+)
+
+if data[GDP_COLUMN].isna().any():
+    raise ValueError(
+        "GDP is missing for one or more event years."
+    )
+
+data["damage_ratio"] = (
+    data[DAMAGE_COLUMN] * 1000.0 / data[GDP_COLUMN]
+)
+
+x_dagum = np.sort(
+    data.loc[
+        data["damage_ratio"] > 0,
+        "damage_ratio",
+    ].to_numpy(float)
+)
+
+x_pareto = np.sort(
+    x_dagum[x_dagum >= PARETO_THRESHOLD]
+)
+
+n_dagum = len(x_dagum)
+n_pareto = len(x_pareto)
+
+if (n_dagum, n_pareto) != (51, 38):
+    raise ValueError(
+        f"Expected 51 Dagum and 38 Pareto observations; "
+        f"got {n_dagum} and {n_pareto}."
+    )
+
+
+lambda_dagum = n_dagum / 25
+lambda_pareto = n_pareto / 25
+
+pareto_alpha = n_pareto / np.sum(
+    np.log(x_pareto / PARETO_THRESHOLD)
+)
+
+dagum_a, dagum_p, _, dagum_b = burr.fit(
+    x_dagum,
+    floc=0,
+)
+
+years = 50
+dt = 1 / 12
+n_steps = int(years / dt)
+
+n_simulations = 5000
+
+theta_grid = np.round(
+    np.arange(0.1, 3.01, 0.1),
+    2,
+)
+
+collapse_threshold = 0.01
+
+# The final five years contain 60 monthly observations.
+last_window_steps = 60
+last_window_start = n_steps - last_window_steps
+
+def generate_jumps(model, arrival_rate, seed):
+    rng = np.random.default_rng(seed)
+
+    counts = rng.poisson(
+        arrival_rate * dt,
+        size=(n_simulations, n_steps),
+    ).astype(np.int16)
+
+    flat = counts.ravel()
+
+    indices = np.repeat(
+        np.arange(flat.size, dtype=np.int32),
+        flat,
+    )
+
+    u = np.clip(
+        rng.random(int(flat.sum())),
+        1e-12,
+        1 - 1e-12,
+    )
+
+    if model == "Pareto":
+        losses = (
+            PARETO_THRESHOLD
+            * (1 - u) ** (-1 / pareto_alpha)
+        )
+
+    else:
+        losses = (
+            dagum_b
+            * (u ** (-1 / dagum_p) - 1)
+            ** (-1 / dagum_a)
+        )
+
+    return np.bincount(
+        indices,
+        weights=losses,
+        minlength=flat.size,
+    ).reshape(n_simulations, n_steps)
+
+
+jumps_p = generate_jumps(
+    model="Pareto",
+    arrival_rate=lambda_pareto,
+    seed=24680,
+)
+
+jumps_d = generate_jumps(
+    model="Dagum",
+    arrival_rate=lambda_dagum,
+    seed=13579,
+)
+
+# The same model-specific shocks are reused across theta values.
+recovery_factors = (
+    1 - theta_grid * dt
+)[:, None]
+
+current_p = np.zeros(
+    (len(theta_grid), n_simulations)
+)
+
+current_d = np.zeros(
+    (len(theta_grid), n_simulations)
+)
+
+last_sum_p = np.zeros_like(current_p)
+last_sum_d = np.zeros_like(current_d)
+
+for step in range(n_steps):
+
+    current_p = np.clip(
+        current_p * recovery_factors
+        + jumps_p[:, step][None, :],
+        0,
+        1,
+    )
+
+    current_d = np.clip(
+        current_d * recovery_factors
+        + jumps_d[:, step][None, :],
+        0,
+        1,
+    )
+
+    if step >= last_window_start:
+        last_sum_p += current_p
+        last_sum_d += current_d
+
+pareto_probability = (
+    np.mean(
+        last_sum_p / last_window_steps
+        >= collapse_threshold,
+        axis=1,
+    )
+    * 100
+)
+
+dagum_probability = (
+    np.mean(
+        last_sum_d / last_window_steps
+        >= collapse_threshold,
+        axis=1,
+    )
+    * 100
+)
+
+plt.close("all")
+
+fig, ax = plt.subplots(
+    figsize=(10, 6.3)
+)
+
+ax.plot(
+    theta_grid,
+    pareto_probability,
+    linestyle="--",
+    marker="o",
+    markersize=4,
+    linewidth=2.2,
+    label="Pareto",
+)
+
+ax.plot(
+    theta_grid,
+    dagum_probability,
+    linestyle="-",
+    marker="o",
+    markersize=4,
+    linewidth=2.2,
+    label="Dagum",
+)
+
+ax.axhline(
+    5.0,
+    linestyle=":",
+    linewidth=1.8,
+    label="5% probability benchmark",
+)
+
+ax.set_xlim(0.05, 3.05)
+
+ax.set_ylim(
+    0,
+    max(
+        10,
+        pareto_probability.max() * 1.08,
+    ),
+)
+
+ax.set_xlabel(
+    r"Rebuilding rate, $\theta$"
+)
+
+ax.set_ylabel(
+    "Persistent collapse probability (%)"
+)
+
+ax.grid(
+    True,
+    linestyle=":",
+    linewidth=0.7,
+    alpha=0.7,
+)
+
+ax.legend(loc="upper right")
+
+fig.tight_layout()
+
+png = (
+    OUTPUT_FOLDER
+    / "Figure_4_Persistent_Collapse_Probability.png"
+)
+
+pdf = (
+    OUTPUT_FOLDER
+    / "Figure_4_Persistent_Collapse_Probability.pdf"
+)
+
+fig.savefig(
+    png,
+    dpi=300,
+    bbox_inches="tight",
+)
+
+fig.savefig(
+    pdf,
+    bbox_inches="tight",
+)
+
+plt.show()
+
+results = pd.DataFrame(
+    {
+        "theta": theta_grid,
+        "Pareto (%)": pareto_probability,
+        "Dagum (%)": dagum_probability,
+    }
+)
+
+print("Saved:", png)
+print("Saved:", pdf)
+print()
+print(results.to_string(index=False))

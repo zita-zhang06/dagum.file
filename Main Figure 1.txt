@@ -1,0 +1,685 @@
+﻿from pathlib import Path
+import warnings
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.stats import burr
+
+def find_data_file():
+
+    file_names = (
+        "EMDAT(2)(1).xlsx.xlsx",
+        "EMDAT(2)(1).xlsx",
+        "EMDAT.xlsx",
+    )
+
+    folders = (
+        Path.cwd(),
+        Path.home() / "Desktop",
+    )
+
+    for folder in folders:
+
+        for file_name in file_names:
+
+            file_path = folder / file_name
+
+            if file_path.exists():
+                return file_path
+
+    raise FileNotFoundError(
+        "The EMDAT Excel file was not found.\n"
+        "Please put EMDAT(2)(1).xlsx.xlsx on the Desktop "
+        "or in the same folder as this Python file."
+    )
+
+
+DATA_FILE = find_data_file()
+OUTPUT_FOLDER = DATA_FILE.parent
+
+BOOTSTRAP_REPLICATIONS = 1000
+BOOTSTRAP_SEED = 20260713
+
+START_YEAR = 2000
+END_YEAR = 2024
+
+PARETO_THRESHOLD = 2e-5
+
+FLOOD_SUBTYPES = (
+    "Flash flood",
+    "Flood (General)",
+    "Riverine flood",
+)
+
+DAMAGE_COLUMN = "Total Damage ('000 US$)"
+GDP_COLUMN = "GDP (current US$)"
+
+events = pd.read_excel(
+    DATA_FILE,
+    sheet_name="Data all",
+)
+
+gdp = pd.read_excel(
+    DATA_FILE,
+    sheet_name="GDP",
+)
+
+events.columns = (
+    events.columns
+    .astype(str)
+    .str.strip()
+)
+
+gdp.columns = (
+    gdp.columns
+    .astype(str)
+    .str.strip()
+)
+
+events["Start Year"] = pd.to_numeric(
+    events["Start Year"],
+    errors="coerce",
+)
+
+events[DAMAGE_COLUMN] = pd.to_numeric(
+    events[DAMAGE_COLUMN],
+    errors="coerce",
+)
+
+gdp["Year"] = pd.to_numeric(
+    gdp["Year"],
+    errors="coerce",
+)
+
+gdp[GDP_COLUMN] = pd.to_numeric(
+    gdp[GDP_COLUMN],
+    errors="coerce",
+)
+
+event_mask = (
+    events["Country"]
+    .astype(str)
+    .str.strip()
+    .eq("Brazil")
+
+    & events["Disaster Type"]
+    .astype(str)
+    .str.strip()
+    .eq("Flood")
+
+    & events["Disaster Subtype"]
+    .astype(str)
+    .str.strip()
+    .isin(FLOOD_SUBTYPES)
+
+    & events["Start Year"]
+    .between(START_YEAR, END_YEAR)
+
+    & events[DAMAGE_COLUMN]
+    .notna()
+
+    & events[DAMAGE_COLUMN]
+    .gt(0)
+)
+
+events = events.loc[
+    event_mask
+].copy()
+
+events["Year"] = (
+    events["Start Year"]
+    .astype(int)
+)
+
+gdp = gdp.loc[
+    gdp["Year"].between(
+        START_YEAR,
+        END_YEAR,
+    )
+    & gdp[GDP_COLUMN].notna(),
+    [
+        "Year",
+        GDP_COLUMN,
+    ],
+].copy()
+
+gdp["Year"] = (
+    gdp["Year"]
+    .astype(int)
+)
+
+data = events.merge(
+    gdp,
+    on="Year",
+    how="left",
+    validate="many_to_one",
+)
+
+if data[GDP_COLUMN].isna().any():
+
+    raise ValueError(
+        "GDP is missing for one or more event years."
+    )
+
+data["damage_ratio"] = (
+    data[DAMAGE_COLUMN]
+    * 1000.0
+    / data[GDP_COLUMN]
+)
+
+x_dagum = np.sort(
+    data.loc[
+        data["damage_ratio"] > 0,
+        "damage_ratio",
+    ].to_numpy(
+        dtype=float,
+    )
+)
+
+x_pareto = np.sort(
+    x_dagum[
+        x_dagum >= PARETO_THRESHOLD
+    ]
+)
+
+n_dagum = len(x_dagum)
+n_pareto = len(x_pareto)
+
+if (
+    n_dagum,
+    n_pareto,
+) != (
+    51,
+    38,
+):
+
+    raise ValueError(
+        "The sample counts do not match the dissertation.\n"
+        "Expected 51 Dagum observations and "
+        "38 Pareto observations.\n"
+        f"Obtained {n_dagum} and {n_pareto}."
+    )
+
+pareto_alpha = (
+    n_pareto
+    / np.sum(
+        np.log(
+            x_pareto
+            / PARETO_THRESHOLD
+        )
+    )
+)
+
+with warnings.catch_warnings():
+
+    warnings.simplefilter(
+        "ignore"
+    )
+
+    (
+        dagum_a,
+        dagum_p,
+        dagum_location,
+        dagum_b,
+    ) = burr.fit(
+        x_dagum,
+        floc=0,
+    )
+
+rng = np.random.default_rng(
+    BOOTSTRAP_SEED
+)
+
+pareto_alpha_boot = np.empty(
+    BOOTSTRAP_REPLICATIONS
+)
+
+dagum_a_boot = np.empty(
+    BOOTSTRAP_REPLICATIONS
+)
+
+dagum_b_boot = np.empty(
+    BOOTSTRAP_REPLICATIONS
+)
+
+dagum_p_boot = np.empty(
+    BOOTSTRAP_REPLICATIONS
+)
+
+with warnings.catch_warnings():
+
+    warnings.simplefilter(
+        "ignore"
+    )
+
+    for replication in range(
+        BOOTSTRAP_REPLICATIONS
+    ):
+
+        pareto_sample = rng.choice(
+            x_pareto,
+            size=n_pareto,
+            replace=True,
+        )
+
+        dagum_sample = rng.choice(
+            x_dagum,
+            size=n_dagum,
+            replace=True,
+        )
+
+        pareto_alpha_boot[
+            replication
+        ] = (
+            n_pareto
+            / np.sum(
+                np.log(
+                    pareto_sample
+                    / PARETO_THRESHOLD
+                )
+            )
+        )
+
+        (
+            fitted_a,
+            fitted_p,
+            fitted_location,
+            fitted_b,
+        ) = burr.fit(
+            dagum_sample,
+            floc=0,
+        )
+
+        dagum_a_boot[
+            replication
+        ] = fitted_a
+
+        dagum_b_boot[
+            replication
+        ] = fitted_b
+
+        dagum_p_boot[
+            replication
+        ] = fitted_p
+
+        if (
+            replication + 1
+        ) % 100 == 0:
+
+            print(
+                "Bootstrap progress:",
+                replication + 1,
+                "/",
+                BOOTSTRAP_REPLICATIONS,
+            )
+
+
+def dagum_survival(
+    x,
+    a,
+    b,
+    p,
+):
+
+    x = np.asarray(
+        x,
+        dtype=float,
+    )
+
+    log_x_over_b = (
+        np.log(x)
+        - np.log(b)
+    )
+
+    log_cdf = (
+        -p
+        * np.logaddexp(
+            0.0,
+            -a * log_x_over_b,
+        )
+    )
+
+    return -np.expm1(
+        log_cdf
+    )
+
+x_grid = np.logspace(
+    np.log10(
+        x_dagum.min()
+        * 0.8
+    ),
+    np.log10(
+        x_dagum.max()
+        * 1.5
+    ),
+    600,
+)
+
+pareto_grid = x_grid[
+    x_grid
+    >= PARETO_THRESHOLD
+]
+
+pareto_tail_share = (
+    n_pareto
+    / n_dagum
+)
+
+dagum_fit = dagum_survival(
+    x_grid,
+    dagum_a,
+    dagum_b,
+    dagum_p,
+)
+
+pareto_fit = (
+    pareto_tail_share
+    * (
+        PARETO_THRESHOLD
+        / pareto_grid
+    )
+    ** pareto_alpha
+)
+
+log_x_over_b_boot = (
+    np.log(
+        x_grid
+    )[None, :]
+    - np.log(
+        dagum_b_boot
+    )[:, None]
+)
+
+log_cdf_boot = (
+    -dagum_p_boot[:, None]
+    * np.logaddexp(
+        0.0,
+        -dagum_a_boot[:, None]
+        * log_x_over_b_boot,
+    )
+)
+
+dagum_boot_curves = (
+    -np.expm1(
+        log_cdf_boot
+    )
+)
+
+dagum_band_lower = np.percentile(
+    dagum_boot_curves,
+    2.5,
+    axis=0,
+)
+
+dagum_band_upper = np.percentile(
+    dagum_boot_curves,
+    97.5,
+    axis=0,
+)
+
+pareto_boot_curves = (
+    pareto_tail_share
+    * (
+        PARETO_THRESHOLD
+        / pareto_grid[
+            None,
+            :,
+        ]
+    )
+    ** pareto_alpha_boot[
+        :,
+        None,
+    ]
+)
+
+pareto_band_lower = np.percentile(
+    pareto_boot_curves,
+    2.5,
+    axis=0,
+)
+
+pareto_band_upper = np.percentile(
+    pareto_boot_curves,
+    97.5,
+    axis=0,
+)
+
+empirical_x = np.sort(
+    x_dagum
+)
+
+empirical_exceedance = (
+    np.arange(
+        n_dagum,
+        0,
+        -1,
+    )
+    / n_dagum
+)
+
+plt.close(
+    "all"
+)
+
+fig, ax = plt.subplots(
+    figsize=(
+        10.5,
+        6.5,
+    )
+)
+
+ax.fill_between(
+    x_grid,
+    np.clip(
+        dagum_band_lower,
+        1e-8,
+        1.0,
+    ),
+    np.clip(
+        dagum_band_upper,
+        1e-8,
+        1.0,
+    ),
+    color="#4C78A8",
+    alpha=0.20,
+    label=(
+        "Dagum 95% bootstrap "
+        "confidence band"
+    ),
+)
+
+ax.fill_between(
+    pareto_grid,
+    np.clip(
+        pareto_band_lower,
+        1e-8,
+        1.0,
+    ),
+    np.clip(
+        pareto_band_upper,
+        1e-8,
+        1.0,
+    ),
+    color="#F58518",
+    alpha=0.20,
+    label=(
+        "Pareto 95% bootstrap "
+        "confidence band"
+    ),
+)
+
+ax.plot(
+    x_grid,
+    dagum_fit,
+    color="#4C78A8",
+    linewidth=2.3,
+    label="Dagum full-sample fit",
+)
+
+ax.plot(
+    pareto_grid,
+    pareto_fit,
+    color="#F58518",
+    linestyle="--",
+    linewidth=2.3,
+    label="Pareto tail fit",
+)
+
+ax.scatter(
+    empirical_x,
+    empirical_exceedance,
+    color="#333333",
+    s=42,
+    alpha=0.78,
+    label=(
+        "Empirical event observations"
+    ),
+    zorder=4,
+)
+
+ax.scatter(
+    [
+        x_dagum.max()
+    ],
+    [
+        1.0
+        / n_dagum
+    ],
+    color="#B22222",
+    marker="*",
+    s=140,
+    label="Largest recorded event",
+    zorder=6,
+)
+
+ax.axvline(
+    PARETO_THRESHOLD,
+    color="#555555",
+    linestyle=":",
+    linewidth=1.4,
+    label="Pareto threshold",
+)
+
+ax.set_xscale(
+    "log"
+)
+
+ax.set_yscale(
+    "log"
+)
+
+ax.set_xlim(
+    x_grid.min(),
+    x_grid.max(),
+)
+
+ax.set_ylim(
+    1e-3,
+    1.08,
+)
+
+ax.set_xlabel(
+    "Event damage ratio, x "
+    "(share of annual GDP)"
+)
+
+ax.set_ylabel(
+    "Probability of exceedance, "
+    "P(X >= x)"
+)
+
+ax.grid(
+    True,
+    which="both",
+    linestyle=":",
+    linewidth=0.7,
+    alpha=0.65,
+)
+
+ax.legend(
+    fontsize=8.7,
+    loc="lower left",
+)
+
+fig.tight_layout()
+
+figure_png = (
+    OUTPUT_FOLDER
+    / "Figure_1_Fitted_Flood_Loss_Distributions.png"
+)
+
+figure_pdf = (
+    OUTPUT_FOLDER
+    / "Figure_1_Fitted_Flood_Loss_Distributions.pdf"
+)
+
+fig.savefig(
+    figure_png,
+    dpi=320,
+    bbox_inches="tight",
+)
+
+fig.savefig(
+    figure_pdf,
+    bbox_inches="tight",
+)
+
+
+# ============================================================
+# 15. Print the results
+# ============================================================
+
+print()
+print("FIGURE 1 COMPLETED SUCCESSFULLY")
+print("--------------------------------")
+
+print(
+    "Pareto alpha:",
+    round(
+        pareto_alpha,
+        9,
+    ),
+)
+
+print(
+    "Dagum a:",
+    round(
+        dagum_a,
+        9,
+    ),
+)
+
+print(
+    "Dagum b:",
+    format(
+        dagum_b,
+        ".12g",
+    ),
+)
+
+print(
+    "Dagum p:",
+    round(
+        dagum_p,
+        9,
+    ),
+)
+
+print()
+print(
+    "PNG saved to:"
+)
+print(
+    figure_png
+)
+
+print()
+print(
+    "PDF saved to:"
+)
+print(
+    figure_pdf
+)
+
+plt.show()

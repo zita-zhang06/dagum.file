@@ -1,0 +1,136 @@
+﻿from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from openpyxl.styles import Alignment, Font, PatternFill
+
+
+def find_data_file():
+    names = ("EMDAT(2)(1).xlsx.xlsx", "EMDAT(2)(1).xlsx", "EMDAT.xlsx")
+    for folder in (Path.cwd(), Path.home() / "Desktop"):
+        for name in names:
+            path = folder / name
+            if path.exists():
+                return path
+    raise FileNotFoundError("Put EMDAT(2)(1).xlsx.xlsx on the Desktop or in the current folder.")
+
+
+DATA_FILE = find_data_file()
+OUTPUT_FILE = DATA_FILE.parent / "Table_D2_Pareto_Threshold_Sensitivity.xlsx"
+DAMAGE_COLUMN = "Total Damage ('000 US$)"
+GDP_COLUMN = "GDP (current US$)"
+FLOOD_SUBTYPES = ("Flash flood", "Flood (General)", "Riverine flood")
+THRESHOLDS = np.array([2e-5, 2.5e-5, 3e-5, 4e-5, 5e-5], dtype=float)
+
+# Construct the 51-event positive-loss sample.
+events = pd.read_excel(DATA_FILE, sheet_name="Data all")
+gdp = pd.read_excel(DATA_FILE, sheet_name="GDP")
+events.columns = events.columns.astype(str).str.strip()
+gdp.columns = gdp.columns.astype(str).str.strip()
+events["Start Year"] = pd.to_numeric(events["Start Year"], errors="coerce")
+events[DAMAGE_COLUMN] = pd.to_numeric(events[DAMAGE_COLUMN], errors="coerce")
+gdp["Year"] = pd.to_numeric(gdp["Year"], errors="coerce")
+gdp[GDP_COLUMN] = pd.to_numeric(gdp[GDP_COLUMN], errors="coerce")
+mask = (
+    events["Country"].astype(str).str.strip().eq("Brazil")
+    & events["Disaster Type"].astype(str).str.strip().eq("Flood")
+    & events["Disaster Subtype"].astype(str).str.strip().isin(FLOOD_SUBTYPES)
+    & events["Start Year"].between(2000, 2024)
+    & events[DAMAGE_COLUMN].notna()
+    & events[DAMAGE_COLUMN].gt(0)
+)
+events = events.loc[mask].copy()
+events["Year"] = events["Start Year"].astype(int)
+gdp = gdp.loc[gdp["Year"].between(2000, 2024), ["Year", GDP_COLUMN]].copy()
+gdp["Year"] = gdp["Year"].astype(int)
+data = events.merge(gdp, on="Year", how="left", validate="many_to_one")
+if data[GDP_COLUMN].isna().any():
+    raise ValueError("GDP is missing for one or more event years.")
+data["damage_ratio"] = data[DAMAGE_COLUMN] * 1000.0 / data[GDP_COLUMN]
+ratios = data.loc[data["damage_ratio"] > 0, "damage_ratio"].to_numpy(float)
+if len(ratios) != 51:
+    raise ValueError(f"Expected 51 positive event losses; got {len(ratios)}.")
+
+
+def simulate_threshold(alpha, threshold, arrival_rate, paths=5000, seed=97531):
+    rng = np.random.default_rng(seed)
+    months = 600
+    dt = 1 / 12
+    theta = 1.0
+    damage = np.zeros(paths)
+    maximum = np.zeros(paths)
+    final_window_sum = np.zeros(paths)
+
+    for month in range(months):
+        counts = rng.poisson(arrival_rate * dt, size=paths)
+        shocks = np.zeros(paths)
+        total_events = int(counts.sum())
+        if total_events:
+            path_indices = np.repeat(np.arange(paths), counts)
+            u = rng.random(total_events)
+            # Stable Pareto inverse transformation. Event severities above one
+            # reach the same 100% damaged-capital cap after updating.
+            log_severity = np.log(threshold) - np.log1p(-u) / alpha
+            severities = np.exp(np.minimum(log_severity, 0.0))
+            shocks = np.bincount(path_indices, weights=severities, minlength=paths)
+
+        damage = np.clip(damage * (1 - theta * dt) + shocks, 0, 1)
+        maximum = np.maximum(maximum, damage)
+        if month >= months - 60:
+            final_window_sum += damage
+
+    final_window_average = final_window_sum / 60
+    return {
+        "Probability max damage > 1% (%)": 100 * np.mean(maximum > 0.01),
+        "Persistent-collapse probability (%)": 100 * np.mean(final_window_average >= 0.01),
+        "Probability of reaching 100% cap (%)": 100 * np.mean(maximum >= 1.0),
+        "Mean maximum damage (%)": 100 * np.mean(maximum),
+        "Median maximum damage (%)": 100 * np.median(maximum),
+    }
+
+
+rows = []
+for threshold in THRESHOLDS:
+    tail = ratios[ratios >= threshold]
+    n = len(tail)
+    alpha = n / np.sum(np.log(tail / threshold))
+    arrival_rate = n / 25
+    rows.append(
+        {
+            "Threshold (GDP share)": threshold,
+            "Threshold (% of GDP)": threshold * 100,
+            "Retained observations": n,
+            "Arrival rate (events/year)": arrival_rate,
+            "Pareto alpha": alpha,
+            **simulate_threshold(alpha, threshold, arrival_rate),
+        }
+    )
+
+table = pd.DataFrame(rows)
+expected_n = [38, 33, 32, 30, 26]
+if table["Retained observations"].tolist() != expected_n:
+    raise ValueError(
+        f"Threshold audit failed. Expected retained counts {expected_n}; "
+        f"got {table['Retained observations'].tolist()}."
+    )
+
+with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
+    # Transpose so the workbook matches the layout shown in the dissertation.
+    display = table.set_index("Threshold (GDP share)").T
+    display.to_excel(writer, sheet_name="Table D2")
+    ws = writer.book["Table D2"]
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor="D9E2F3")
+        cell.alignment = Alignment(horizontal="center")
+    ws.column_dimensions["A"].width = 44
+    for column in ("B", "C", "D", "E", "F"):
+        ws.column_dimensions[column].width = 16
+    for row in ws.iter_rows(min_row=2, min_col=2):
+        for cell in row:
+            cell.alignment = Alignment(horizontal="center")
+            cell.number_format = "0.000"
+
+print(table.round(3).to_string(index=False))
+print("Saved:", OUTPUT_FILE)
+```

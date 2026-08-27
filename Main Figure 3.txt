@@ -1,0 +1,610 @@
+﻿from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.stats import burr
+
+def find_data_file():
+
+    file_names = (
+        "EMDAT(2)(1).xlsx.xlsx",
+        "EMDAT(2)(1).xlsx",
+        "EMDAT.xlsx",
+    )
+
+    folders = (
+        Path.cwd(),
+        Path.home() / "Desktop",
+    )
+
+    for folder in folders:
+
+        for file_name in file_names:
+
+            file_path = folder / file_name
+
+            if file_path.exists():
+                return file_path
+
+    raise FileNotFoundError(
+        "The EMDAT Excel file was not found.\n"
+        "Please put EMDAT(2)(1).xlsx.xlsx on the Desktop "
+        "or in the same folder as this Python file."
+    )
+
+
+DATA_FILE = find_data_file()
+OUTPUT_FOLDER = DATA_FILE.parent
+
+DAMAGE_COLUMN = "Total Damage ('000 US$)"
+GDP_COLUMN = "GDP (current US$)"
+
+FLOOD_SUBTYPES = (
+    "Flash flood",
+    "Flood (General)",
+    "Riverine flood",
+)
+
+PARETO_THRESHOLD = 2e-5
+
+events = pd.read_excel(
+    DATA_FILE,
+    sheet_name="Data all",
+)
+
+gdp = pd.read_excel(
+    DATA_FILE,
+    sheet_name="GDP",
+)
+
+events.columns = (
+    events.columns
+    .astype(str)
+    .str.strip()
+)
+
+gdp.columns = (
+    gdp.columns
+    .astype(str)
+    .str.strip()
+)
+
+events["Start Year"] = pd.to_numeric(
+    events["Start Year"],
+    errors="coerce",
+)
+
+events[DAMAGE_COLUMN] = pd.to_numeric(
+    events[DAMAGE_COLUMN],
+    errors="coerce",
+)
+
+gdp["Year"] = pd.to_numeric(
+    gdp["Year"],
+    errors="coerce",
+)
+
+gdp[GDP_COLUMN] = pd.to_numeric(
+    gdp[GDP_COLUMN],
+    errors="coerce",
+)
+
+event_mask = (
+    events["Country"]
+    .astype(str)
+    .str.strip()
+    .eq("Brazil")
+
+    & events["Disaster Type"]
+    .astype(str)
+    .str.strip()
+    .eq("Flood")
+
+    & events["Disaster Subtype"]
+    .astype(str)
+    .str.strip()
+    .isin(FLOOD_SUBTYPES)
+
+    & events["Start Year"]
+    .between(2000, 2024)
+
+    & events[DAMAGE_COLUMN]
+    .notna()
+
+    & events[DAMAGE_COLUMN]
+    .gt(0)
+)
+
+events = events.loc[
+    event_mask
+].copy()
+
+events["Year"] = (
+    events["Start Year"]
+    .astype(int)
+)
+
+gdp = gdp.loc[
+    gdp["Year"].between(
+        2000,
+        2024,
+    ),
+    [
+        "Year",
+        GDP_COLUMN,
+    ],
+].copy()
+
+gdp["Year"] = (
+    gdp["Year"]
+    .astype(int)
+)
+
+data = events.merge(
+    gdp,
+    on="Year",
+    how="left",
+    validate="many_to_one",
+)
+
+if data[GDP_COLUMN].isna().any():
+
+    raise ValueError(
+        "GDP is missing for one or more event years."
+    )
+
+data["damage_ratio"] = (
+    data[DAMAGE_COLUMN]
+    * 1000.0
+    / data[GDP_COLUMN]
+)
+
+x_dagum = np.sort(
+    data.loc[
+        data["damage_ratio"] > 0,
+        "damage_ratio",
+    ].to_numpy(
+        dtype=float,
+    )
+)
+
+x_pareto = np.sort(
+    x_dagum[
+        x_dagum >= PARETO_THRESHOLD
+    ]
+)
+
+n_dagum = len(
+    x_dagum
+)
+
+n_pareto = len(
+    x_pareto
+)
+
+if (
+    n_dagum,
+    n_pareto,
+) != (
+    51,
+    38,
+):
+
+    raise ValueError(
+        "The sample counts do not match the dissertation.\n"
+        f"Expected 51 and 38; obtained {n_dagum} and {n_pareto}."
+    )
+
+number_of_years = 25
+
+lambda_dagum = (
+    n_dagum
+    / number_of_years
+)
+
+lambda_pareto = (
+    n_pareto
+    / number_of_years
+)
+
+pareto_alpha = (
+    n_pareto
+    / np.sum(
+        np.log(
+            x_pareto
+            / PARETO_THRESHOLD
+        )
+    )
+)
+
+(
+    dagum_a,
+    dagum_p,
+    dagum_location,
+    dagum_b,
+) = burr.fit(
+    x_dagum,
+    floc=0,
+)
+
+years = 50
+
+dt = (
+    1
+    / 12
+)
+
+n_steps = int(
+    years
+    / dt
+)
+
+n_simulations = 10000
+
+theta = 1.0
+
+recovery_factor = (
+    1
+    - theta * dt
+)
+
+def simulate_maximum_damage(
+    model_name,
+    arrival_rate,
+    random_seed,
+):
+
+    rng = np.random.default_rng(
+        random_seed
+    )
+
+    event_counts = rng.poisson(
+        arrival_rate * dt,
+        size=(
+            n_simulations,
+            n_steps,
+        ),
+    ).astype(
+        np.int16
+    )
+
+    flat_counts = (
+        event_counts
+        .ravel()
+    )
+
+    total_events = int(
+        flat_counts.sum()
+    )
+
+    cell_index = np.repeat(
+        np.arange(
+            flat_counts.size,
+            dtype=np.int32,
+        ),
+        flat_counts,
+    )
+
+    uniform_values = rng.random(
+        total_events
+    )
+
+    uniform_values = np.clip(
+        uniform_values,
+        1e-12,
+        1 - 1e-12,
+    )
+
+    if model_name == "Pareto":
+
+        event_losses = (
+            PARETO_THRESHOLD
+            * (
+                1
+                - uniform_values
+            )
+            ** (
+                -1
+                / pareto_alpha
+            )
+        )
+
+    elif model_name == "Dagum":
+
+        event_losses = (
+            dagum_b
+            * (
+                uniform_values
+                ** (
+                    -1
+                    / dagum_p
+                )
+                - 1
+            )
+            ** (
+                -1
+                / dagum_a
+            )
+        )
+
+    else:
+
+        raise ValueError(
+            "model_name must be Pareto or Dagum."
+        )
+
+    monthly_jumps = np.bincount(
+        cell_index,
+        weights=event_losses,
+        minlength=flat_counts.size,
+    ).reshape(
+        n_simulations,
+        n_steps,
+    )
+
+    current_damage = np.zeros(
+        n_simulations
+    )
+
+    maximum_damage = np.zeros(
+        n_simulations
+    )
+
+    for step in range(
+        n_steps
+    ):
+
+        current_damage = np.clip(
+            current_damage
+            * recovery_factor
+            + monthly_jumps[
+                :,
+                step,
+            ],
+            0,
+            1,
+        )
+
+        maximum_damage = np.maximum(
+            maximum_damage,
+            current_damage,
+        )
+
+    return maximum_damage
+
+print(
+    "Running the Pareto simulation..."
+)
+
+maximum_pareto = simulate_maximum_damage(
+    model_name="Pareto",
+    arrival_rate=lambda_pareto,
+    random_seed=12345,
+)
+
+print(
+    "Running the Dagum simulation..."
+)
+
+maximum_dagum = simulate_maximum_damage(
+    model_name="Dagum",
+    arrival_rate=lambda_dagum,
+    random_seed=54321,
+)
+
+pareto_percent = np.sort(
+    maximum_pareto
+    * 100
+)
+
+dagum_percent = np.sort(
+    maximum_dagum
+    * 100
+)
+
+damage_grid = np.logspace(
+    -2,
+    2,
+    800,
+)
+
+pareto_exceedance = (
+    (
+        n_simulations
+        - np.searchsorted(
+            pareto_percent,
+            damage_grid,
+            side="left",
+        )
+    )
+    / n_simulations
+    * 100
+)
+
+dagum_exceedance = (
+    (
+        n_simulations
+        - np.searchsorted(
+            dagum_percent,
+            damage_grid,
+            side="left",
+        )
+    )
+    / n_simulations
+    * 100
+)
+
+plt.close(
+    "all"
+)
+
+fig, ax = plt.subplots(
+    figsize=(
+        10,
+        6.3,
+    )
+)
+
+ax.plot(
+    damage_grid,
+    pareto_exceedance,
+    linestyle="--",
+    linewidth=2.3,
+    label="Pareto",
+)
+
+ax.plot(
+    damage_grid,
+    dagum_exceedance,
+    linestyle="-",
+    linewidth=2.3,
+    label="Dagum",
+)
+
+ax.set_xscale(
+    "log"
+)
+
+ax.set_xlim(
+    0.01,
+    100,
+)
+
+ax.set_ylim(
+    0,
+    102,
+)
+
+ax.set_xlabel(
+    "Maximum damaged capital stock ratio "
+    "over 50 years (%)"
+)
+
+ax.set_ylabel(
+    "Probability of exceedance (%)"
+)
+
+ax.grid(
+    True,
+    which="both",
+    linestyle=":",
+    linewidth=0.7,
+    alpha=0.7,
+)
+
+ax.legend(
+    loc="upper right"
+)
+
+fig.tight_layout()
+
+figure_png = (
+    OUTPUT_FOLDER
+    / "Figure_3_Maximum_Damage_Exceedance.png"
+)
+
+figure_pdf = (
+    OUTPUT_FOLDER
+    / "Figure_3_Maximum_Damage_Exceedance.pdf"
+)
+
+fig.savefig(
+    figure_png,
+    dpi=300,
+    bbox_inches="tight",
+)
+
+fig.savefig(
+    figure_pdf,
+    bbox_inches="tight",
+)
+
+pareto_probability_at_one_percent = (
+    np.mean(
+        maximum_pareto
+        >= 0.01
+    )
+    * 100
+)
+
+dagum_probability_at_one_percent = (
+    np.mean(
+        maximum_dagum
+        >= 0.01
+    )
+    * 100
+)
+
+print()
+print("FIGURE 3 COMPLETED SUCCESSFULLY")
+print("--------------------------------")
+
+print(
+    "Pareto observations:",
+    n_pareto,
+)
+
+print(
+    "Dagum observations:",
+    n_dagum,
+)
+
+print(
+    "Pareto arrival rate:",
+    round(
+        lambda_pareto,
+        4,
+    ),
+)
+
+print(
+    "Dagum arrival rate:",
+    round(
+        lambda_dagum,
+        4,
+    ),
+)
+
+print()
+print(
+    "At the 1% threshold:"
+)
+
+print(
+    "Pareto:",
+    round(
+        pareto_probability_at_one_percent,
+        2,
+    ),
+    "%",
+)
+
+print(
+    "Dagum:",
+    round(
+        dagum_probability_at_one_percent,
+        2,
+    ),
+    "%",
+)
+
+print()
+print(
+    "PNG saved to:"
+)
+
+print(
+    figure_png
+)
+
+print()
+print(
+    "PDF saved to:"
+)
+
+print(
+    figure_pdf
+)
+
+plt.show()

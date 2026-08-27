@@ -1,0 +1,107 @@
+﻿from pathlib import Path
+import warnings
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.stats import burr
+
+
+def find_data_file():
+    names = ("EMDAT(2)(1).xlsx.xlsx", "EMDAT(2)(1).xlsx", "EMDAT.xlsx")
+    for folder in (Path.cwd(), Path.home() / "Desktop"):
+        for name in names:
+            path = folder / name
+            if path.exists():
+                return path
+    raise FileNotFoundError("Put EMDAT(2)(1).xlsx.xlsx on the Desktop or in the current folder.")
+
+
+DATA_FILE = find_data_file()
+OUTPUT_FOLDER = DATA_FILE.parent
+DAMAGE_COLUMN = "Total Damage ('000 US$)"
+GDP_COLUMN = "GDP (current US$)"
+FLOOD_SUBTYPES = ("Flash flood", "Flood (General)", "Riverine flood")
+PARETO_THRESHOLD = 2e-5
+BOOTSTRAP_REPLICATIONS = 1000
+BOOTSTRAP_SEED = 20260713
+
+events = pd.read_excel(DATA_FILE, sheet_name="Data all")
+gdp = pd.read_excel(DATA_FILE, sheet_name="GDP")
+events.columns = events.columns.astype(str).str.strip()
+gdp.columns = gdp.columns.astype(str).str.strip()
+events["Start Year"] = pd.to_numeric(events["Start Year"], errors="coerce")
+events[DAMAGE_COLUMN] = pd.to_numeric(events[DAMAGE_COLUMN], errors="coerce")
+gdp["Year"] = pd.to_numeric(gdp["Year"], errors="coerce")
+gdp[GDP_COLUMN] = pd.to_numeric(gdp[GDP_COLUMN], errors="coerce")
+mask = (
+    events["Country"].astype(str).str.strip().eq("Brazil")
+    & events["Disaster Type"].astype(str).str.strip().eq("Flood")
+    & events["Disaster Subtype"].astype(str).str.strip().isin(FLOOD_SUBTYPES)
+    & events["Start Year"].between(2000, 2024)
+    & events[DAMAGE_COLUMN].notna()
+    & events[DAMAGE_COLUMN].gt(0)
+)
+events = events.loc[mask].copy()
+events["Year"] = events["Start Year"].astype(int)
+gdp = gdp.loc[gdp["Year"].between(2000, 2024), ["Year", GDP_COLUMN]].copy()
+gdp["Year"] = gdp["Year"].astype(int)
+data = events.merge(gdp, on="Year", how="left", validate="many_to_one")
+if data[GDP_COLUMN].isna().any():
+    raise ValueError("GDP is missing for one or more event years.")
+data["damage_ratio"] = data[DAMAGE_COLUMN] * 1000.0 / data[GDP_COLUMN]
+x_dagum = np.sort(data.loc[data["damage_ratio"] > 0, "damage_ratio"].to_numpy(float))
+x_pareto = np.sort(x_dagum[x_dagum >= PARETO_THRESHOLD])
+n_dagum, n_pareto = len(x_dagum), len(x_pareto)
+if (n_dagum, n_pareto) != (51, 38):
+    raise ValueError(f"Expected 51 Dagum and 38 Pareto observations; got {n_dagum} and {n_pareto}.")
+
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    dagum_a, dagum_p, _, dagum_b = burr.fit(x_dagum, floc=0)
+
+# The unused Pareto draw in each replication is intentional. It preserves the
+# exact joint bootstrap random-number sequence used for Table 1 and Figure 1.
+rng = np.random.default_rng(BOOTSTRAP_SEED)
+dagum_a_boot = np.empty(BOOTSTRAP_REPLICATIONS)
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    for i in range(BOOTSTRAP_REPLICATIONS):
+        _ = rng.choice(x_pareto, size=n_pareto, replace=True)
+        dagum_sample = rng.choice(x_dagum, size=n_dagum, replace=True)
+        fitted_a, _, _, _ = burr.fit(dagum_sample, floc=0)
+        dagum_a_boot[i] = fitted_a
+
+dagum_a_ci = np.percentile(dagum_a_boot, [2.5, 97.5])
+positive_a = dagum_a_boot[np.isfinite(dagum_a_boot) & (dagum_a_boot > 0)]
+display_limit = np.percentile(positive_a, 99.5)
+display_a = positive_a[positive_a <= display_limit]
+histogram_bins = np.logspace(np.log10(display_a.min()), np.log10(display_a.max()), 42)
+
+plt.close("all")
+fig, ax = plt.subplots(figsize=(9.5, 6.2))
+ax.hist(display_a, bins=histogram_bins, color="#4C78A8", alpha=0.78, edgecolor="white")
+ax.axvline(1.0, color="#B22222", linestyle=":", linewidth=2.0, label="Mean boundary: a = 1")
+ax.axvline(2.0, color="#F58518", linestyle="--", linewidth=2.0, label="Second-moment boundary: a = 2")
+ax.axvline(dagum_a, color="#333333", linewidth=2.0, label=f"Point estimate: a = {dagum_a:.3f}")
+ax.set_xscale("log")
+ax.set_xlabel("Bootstrap estimate of Dagum parameter a (log scale)")
+ax.set_ylabel("Number of bootstrap replications")
+ax.set_title(
+    "Bootstrap distribution of the Dagum upper-tail parameter\n"
+    f"95% percentile interval: [{dagum_a_ci[0]:.3f}, {dagum_a_ci[1]:.3f}]"
+)
+ax.grid(True, which="both", linestyle=":", linewidth=0.7, alpha=0.65)
+ax.legend()
+fig.tight_layout()
+
+png = OUTPUT_FOLDER / "Figure_D1_Dagum_a_Bootstrap_Distribution.png"
+pdf = OUTPUT_FOLDER / "Figure_D1_Dagum_a_Bootstrap_Distribution.pdf"
+fig.savefig(png, dpi=320, bbox_inches="tight")
+fig.savefig(pdf, bbox_inches="tight")
+plt.show()
+
+print("Saved:", png)
+print("Saved:", pdf)
+print(f"Dagum a = {dagum_a:.9f}")
+print(f"95% interval = [{dagum_a_ci[0]:.9f}, {dagum_a_ci[1]:.9f}]")

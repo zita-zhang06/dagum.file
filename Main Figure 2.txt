@@ -1,0 +1,539 @@
+﻿from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.stats import burr
+
+def find_data_file():
+
+    file_names = (
+        "EMDAT(2)(1).xlsx.xlsx",
+        "EMDAT(2)(1).xlsx",
+        "EMDAT.xlsx",
+    )
+
+    folders = (
+        Path.cwd(),
+        Path.home() / "Desktop",
+    )
+
+    for folder in folders:
+
+        for file_name in file_names:
+
+            file_path = folder / file_name
+
+            if file_path.exists():
+                return file_path
+
+    raise FileNotFoundError(
+        "The EMDAT Excel file was not found.\n"
+        "Please put EMDAT(2)(1).xlsx.xlsx on the Desktop "
+        "or in the same folder as this Python file."
+    )
+
+
+DATA_FILE = find_data_file()
+OUTPUT_FOLDER = DATA_FILE.parent
+
+DAMAGE_COLUMN = "Total Damage ('000 US$)"
+GDP_COLUMN = "GDP (current US$)"
+
+FLOOD_SUBTYPES = (
+    "Flash flood",
+    "Flood (General)",
+    "Riverine flood",
+)
+
+events = pd.read_excel(
+    DATA_FILE,
+    sheet_name="Data all",
+)
+
+gdp = pd.read_excel(
+    DATA_FILE,
+    sheet_name="GDP",
+)
+
+events.columns = (
+    events.columns
+    .astype(str)
+    .str.strip()
+)
+
+gdp.columns = (
+    gdp.columns
+    .astype(str)
+    .str.strip()
+)
+
+events["Start Year"] = pd.to_numeric(
+    events["Start Year"],
+    errors="coerce",
+)
+
+events[DAMAGE_COLUMN] = pd.to_numeric(
+    events[DAMAGE_COLUMN],
+    errors="coerce",
+)
+
+gdp["Year"]"] = pd.to_numeric(
+    gdp["Year"],
+    errors="coerce",
+)
+
+gdp[GDP_COLUMN] = pd.to_numeric(
+    gdp[GDP_COLUMN],
+    errors="coerce",
+)
+
+event_mask = (
+    events["Country"]
+    .astype(str)
+    .str.strip()
+    .eq("Brazil")
+
+    & events["Disaster Type"]
+    .astype(str)
+    .str.strip()
+    .eq("Flood")
+
+    & events["Disaster Subtype"]
+    .astype(str)
+    .str.strip()
+    .isin(FLOOD_SUBTYPES)
+
+    & events["Start Year"]
+    .between(2000, 2024)
+
+    & events[DAMAGE_COLUMN]
+    .notna()
+
+    & events[DAMAGE_COLUMN]
+    .gt(0)
+)
+
+events = events.loc[
+    event_mask
+].copy()
+
+events["Year"] = (
+    events["Start Year"]
+    .astype(int)
+)
+
+gdp = gdp.loc[
+    gdp["Year"].between(
+        2000,
+        2024,
+    ),
+    [
+        "Year",
+        GDP_COLUMN,
+    ],
+].copy()
+
+gdp["Year"] = (
+    gdp["Year"]
+    .astype(int)
+)
+
+data = events.merge(
+    gdp,
+    on="Year",
+    how="left",
+    validate="many_to_one",
+)
+
+if data[GDP_COLUMN].isna().any():
+
+    raise ValueError(
+        "GDP is missing for one or more event years."
+    )
+
+data["damage_ratio"] = (
+    data[DAMAGE_COLUMN]
+    * 1000.0
+    / data[GDP_COLUMN]
+)
+
+x_dagum = np.sort(
+    data.loc[
+        data["damage_ratio"] > 0,
+        "damage_ratio",
+    ].to_numpy(
+        dtype=float,
+    )
+)
+
+n_dagum = len(
+    x_dagum
+)
+
+if n_dagum != 51:
+
+    raise ValueError(
+        "The sample count does not match the dissertation.\n"
+        f"Expected 51 positive event losses; obtained {n_dagum}."
+    )
+
+(
+    dagum_a,
+    dagum_p,
+    dagum_location,
+    dagum_b,
+) = burr.fit(
+    x_dagum,
+    floc=0,
+)
+
+number_of_years = 25
+
+lambda_dagum = (
+    n_dagum
+    / number_of_years
+)
+
+years = 50
+
+dt = (
+    1
+    / 12
+)
+
+n_steps = int(
+    years
+    / dt
+)
+
+n_simulations = 10000
+
+theta = 1.0
+
+collapse_threshold = 0.01
+
+random_seed = 12345
+
+rng = np.random.default_rng(
+    random_seed
+)
+
+event_counts = rng.poisson(
+    lambda_dagum * dt,
+    size=(
+        n_simulations,
+        n_steps,
+    ),
+).astype(
+    np.int16
+)
+
+flat_counts = (
+    event_counts
+    .ravel()
+)
+
+total_events = int(
+    flat_counts.sum()
+)
+
+cell_index = np.repeat(
+    np.arange(
+        flat_counts.size,
+        dtype=np.int32,
+    ),
+    flat_counts,
+)
+
+uniform_values = rng.random(
+    total_events
+)
+
+uniform_values = np.clip(
+    uniform_values,
+    1e-12,
+    1 - 1e-12,
+)
+
+event_losses = (
+    dagum_b
+    * (
+        uniform_values
+        ** (
+            -1
+            / dagum_p
+        )
+        - 1
+    )
+    ** (
+        -1
+        / dagum_a
+    )
+)
+
+monthly_jumps = np.bincount(
+    cell_index,
+    weights=event_losses,
+    minlength=flat_counts.size,
+).reshape(
+    n_simulations,
+    n_steps,
+)
+
+damage_paths = np.zeros(
+    (
+        n_simulations,
+        n_steps + 1,
+    ),
+    dtype=float,
+)
+
+recovery_factor = (
+    1
+    - theta * dt
+)
+
+for step in range(
+    n_steps
+):
+
+    damage_paths[
+        :,
+        step + 1,
+    ] = np.clip(
+        damage_paths[
+            :,
+            step,
+        ]
+        * recovery_factor
+        + monthly_jumps[
+            :,
+            step,
+        ],
+        0,
+        1,
+    )
+
+time = np.linspace(
+    0,
+    years,
+    n_steps + 1,
+)
+
+path_maximum = (
+    damage_paths
+    .max(
+        axis=1
+    )
+)
+
+display_quantiles = np.array(
+    [
+        0.50,
+        0.60,
+        0.70,
+        0.78,
+        0.85,
+        0.90,
+        0.93,
+        0.95,
+        0.96,
+        0.97,
+        0.98,
+    ]
+)
+
+display_targets = np.quantile(
+    path_maximum,
+    display_quantiles,
+)
+
+display_ids = np.array(
+    [
+        np.abs(
+            path_maximum
+            - target
+        ).argmin()
+
+        for target
+        in display_targets
+    ]
+)
+
+display_paths = (
+    damage_paths[
+        display_ids
+    ]
+    * 100
+)
+
+threshold_percent = (
+    collapse_threshold
+    * 100
+)
+
+display_upper = max(
+    threshold_percent
+    * 1.25,
+
+    np.percentile(
+        path_maximum,
+        98,
+    )
+    * 100
+    * 1.15,
+)
+
+plt.close(
+    "all"
+)
+
+fig, ax = plt.subplots(
+    figsize=(
+        10,
+        6.2,
+    )
+)
+
+lines = ax.plot(
+    time,
+    display_paths.T,
+    linewidth=1.0,
+    alpha=0.75,
+)
+
+lines[0].set_label(
+    "Representative Dagum paths"
+)
+
+ax.axhline(
+    threshold_percent,
+    linewidth=1.8,
+    linestyle=":",
+    color="red",
+    label="Collapse threshold",
+)
+
+ax.set_xlim(
+    0,
+    years,
+)
+
+ax.set_ylim(
+    0,
+    display_upper,
+)
+
+ax.set_xlabel(
+    "Time (years)"
+)
+
+ax.set_ylabel(
+    "Damaged capital stock ratio (%)"
+)
+
+ax.grid(
+    True,
+    linestyle=":",
+    linewidth=0.7,
+    alpha=0.7,
+)
+
+ax.legend(
+    loc="upper right"
+)
+
+fig.tight_layout()
+
+figure_png = (
+    OUTPUT_FOLDER
+    / "Figure_2_Representative_Dagum_Paths.png"
+)
+
+figure_pdf = (
+    OUTPUT_FOLDER
+    / "Figure_2_Representative_Dagum_Paths.pdf"
+)
+
+fig.savefig(
+    figure_png,
+    dpi=300,
+    bbox_inches="tight",
+)
+
+fig.savefig(
+    figure_pdf,
+    bbox_inches="tight",
+)
+
+print()
+print("FIGURE 2 COMPLETED SUCCESSFULLY")
+print("--------------------------------")
+
+print(
+    "Dagum observations:",
+    n_dagum,
+)
+
+print(
+    "Dagum arrival rate:",
+    round(
+        lambda_dagum,
+        4,
+    ),
+)
+
+print(
+    "Dagum a:",
+    round(
+        dagum_a,
+        9,
+    ),
+)
+
+print(
+    "Dagum b:",
+    format(
+        dagum_b,
+        ".12g",
+    ),
+)
+
+print(
+    "Dagum p:",
+    round(
+        dagum_p,
+        9,
+    ),
+)
+
+print()
+print(
+    "The displayed paths represent "
+    "these maximum-loss quantiles:"
+)
+
+print(
+    display_quantiles
+)
+
+print()
+print(
+    "PNG saved to:"
+)
+
+print(
+    figure_png
+)
+
+print()
+print(
+    "PDF saved to:"
+)
+
+print(
+    figure_pdf
+)
+
+plt.show()
